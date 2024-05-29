@@ -187,5 +187,15 @@
         ]
       }
     }
+  },
+  "send_request": {
+    "type": "chat",
+    "opts": {
+      "template": "{{input}}",
+      "strategy": "append",
+      "params": {
+        "model": "gpt-4-turbo"
+      }
+    }
   }
 }
