@@ -194,8 +194,8 @@
       "template": "{{input}}",
       "strategy": "append",
       "params": {
-        "model": "gpt-4o",
-        "max_tokens": 2048
+        "model": "gpt-5.1",
+        "max_tokens": 4096
       }
     }
   }
