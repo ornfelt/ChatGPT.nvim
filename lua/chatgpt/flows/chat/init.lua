@@ -19,8 +19,8 @@ M.open = function()
       M.chat:toggle()
       return
     end
-    -- Tab was closed externally: properly tear down nui to clear its autocmds
-    pcall(function() M.chat.layout:unmount() end)
+    -- Layout was destroyed externally (e.g. tabclose).
+    M.chat.active = false
     M.chat = nil
   end
   M.chat = Chat:new()
