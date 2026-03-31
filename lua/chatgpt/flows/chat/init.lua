@@ -14,11 +14,17 @@ local M = {
 
 M.open = function()
   if M.chat ~= nil and M.chat.active then
-    M.chat:toggle()
-  else
-    M.chat = Chat:new()
-    M.chat:open()
+    -- Guard against stale layout state (e.g. tab was closed externally)
+    local winid = M.chat.layout and M.chat.layout.winid
+    if winid ~= nil and vim.api.nvim_win_is_valid(winid) then
+      M.chat:toggle()
+      return
+    end
+    -- Layout is stale - fall through and create a fresh chat
+    M.chat = nil
   end
+  M.chat = Chat:new()
+  M.chat:open()
 end
 
 M.open_with_awesome_prompt = function()
