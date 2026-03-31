@@ -1750,6 +1750,24 @@ function Chat:open()
   self.chat_input:on(event.QuitPre, function()
     self.active = false
   end)
+
+  -- Intercept external window close (e.g. tabclose) and run proper nui cleanup
+  -- so BufWinEnter autocmds don't fire with a nil bufnr next open
+  if self.chat_input and self.chat_input.winid then
+    vim.api.nvim_create_autocmd("WinClosed", {
+      group = resize_group, -- cleaned up on next open
+      pattern = tostring(self.chat_input.winid),
+      once = true,
+      callback = function()
+        vim.schedule(function()
+          if self.active then
+            self.active = false
+            pcall(function() self.layout:hide() end)
+          end
+        end)
+      end,
+    })
+  end
 end
 
 function Chat:open_system_panel()
