@@ -12,31 +12,29 @@ local M = {
   chat = nil,
 }
 
+--M.open = function()
+--  if M.chat ~= nil and M.chat.active then
+--    M.chat:toggle()
+--  else
+--    M.chat = Chat:new()
+--    M.chat:open()
+--  end
+--end
 M.open = function()
-  local api = vim.api
-  -- If there is an existing chat, check layout validity
   if M.chat ~= nil then
-    local layout = M.chat.layout
-    local active = M.chat.active
-
-    -- If layout exists but its main window is invalid, hard-reset
-    if layout and layout.winid and not api.nvim_win_is_valid(layout.winid) then
-      -- optionally: try/pcall to unmount to clean up NUI state
-      pcall(function()
-        if layout.unmount then
-          layout:unmount()
-        end
-      end)
-
-      M.chat = nil
-    elseif active then
-      -- Valid/active window: just toggle the existing one
-      M.chat:toggle()
+    local ok = pcall(function()
+      if M.chat.active then
+        M.chat:toggle()
+      end
+    end)
+    if ok and M.chat and M.chat.active then
       return
     end
+    -- Reset on any error or inactive state
+    pcall(function() M.chat.layout:unmount() end)
+    M.chat = nil
   end
 
-  -- Create a fresh chat always if we get here
   M.chat = Chat:new()
   M.chat:open()
 end
