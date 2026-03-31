@@ -14,13 +14,13 @@ local M = {
 
 M.open = function()
   if M.chat ~= nil and M.chat.active then
-    -- Guard against stale layout state (e.g. tab was closed externally)
     local winid = M.chat.layout and M.chat.layout.winid
     if winid ~= nil and vim.api.nvim_win_is_valid(winid) then
       M.chat:toggle()
       return
     end
-    -- Layout is stale - fall through and create a fresh chat
+    -- Tab was closed externally: properly tear down nui to clear its autocmds
+    pcall(function() M.chat.layout:unmount() end)
     M.chat = nil
   end
   M.chat = Chat:new()
