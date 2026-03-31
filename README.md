@@ -32,6 +32,14 @@ test addition, code optimization, summarization, bug fixing, code explanation,
 Roxygen editing, and code readability analysis. Additionally, you can define
 your own custom actions using a JSON file.
 
+- **Rich Message Rendering**: Enhanced chat display with styled code blocks
+(language headers, copy indicators, foldable), markdown formatting (headers,
+bold, italic, lists, blockquotes, links), diff highlighting, and sender indicators.
+
+- **Inline Context References**: Use `@` to add context from LSP definitions or
+project files directly in your prompts. References are displayed inline and
+expanded when sending to the API.
+
 For a comprehensive understanding of the extension's functionality, you can watch
 a plugin showcase [video](https://www.youtube.com/watch?v=7k0KZsheLP4)
 
@@ -163,12 +171,12 @@ A simple configuration of the chat model could look something like this:
         -- Example:
         -- model = function()
         --     if some_condition() then
-        --         return "gpt-4-1106-preview"
+        --         return "gpt-5"
         --     else
-        --         return "gpt-3.5-turbo"
+        --         return "gpt-5-mini"
         --     end
         -- end,
-        model = "gpt-4-1106-preview",
+        model = "gpt-5-mini",
         frequency_penalty = 0,
         presence_penalty = 0,
         max_tokens = 4095,
@@ -228,7 +236,7 @@ Plugin exposes following commands:
 
 ### `ChatGPT`
 
-`ChatGPT` command which opens interactive window using the `gpt-3.5-turbo`
+`ChatGPT` command which opens interactive window using the `gpt-5-mini`
 model.
 (also known as `ChatGPT`)
 
@@ -236,15 +244,14 @@ model.
 
 `ChatGPTActAs` command which opens a prompt selection from
 [Awesome ChatGPT Prompts](https://github.com/f/awesome-chatgpt-prompts)
-to be used with the `gpt-3.5-turbo` model.
+to be used with the `gpt-5-mini` model.
 
 ![preview image](https://github.com/jackMort/ChatGPT.nvim/blob/media/preview-3.png?raw=true)
 
 ### `ChatGPTEditWithInstructions`
 
 `ChatGPTEditWithInstructions` command which opens interactive window to edit
-selected text or whole window using the `code-davinci-edit-001` model (GPT 3.5
-fine-tuned for coding).
+selected text or whole window using the `gpt-5-mini` model (configurable).
 
 You can map it using the Lua API, e.g. using `which-key.nvim`:
 
@@ -287,8 +294,11 @@ list. Available actions are:
   9. `explain_code`
   10. `roxygen_edit`
   11. `code_readability_analysis` -- see [demo](https://youtu.be/zlU3YGGv2zY)
+  12. `fix_diagnostic` -- fix error under cursor
+  13. `explain_diagnostic` -- explain error under cursor
+  14. `fix_diagnostics` -- fix all errors in selection
 
-All the above actions are using `gpt-3.5-turbo` model.
+All the above actions are using `gpt-5-mini` model.
 
 It is possible to define custom actions with a JSON file. See [`actions.json`](./lua/chatgpt/flows/actions/actions.json) for an example. The path of custom actions can be set in the config (see `actions_paths` field in the config example above).
 
@@ -299,10 +309,10 @@ An example of custom action may look like this: (`#` marks comments)
   "action_name": {
     "type": "chat", # or "completion" or "edit"
     "opts": {
-      "template": "A template using possible variable: {{filetype}} (neovim filetype), {{input}} (the selected text) an {{argument}} (provided on the command line), {{filepath}} (the relative path to the file)",
+      "template": "A template using possible variables",
       "strategy": "replace", # or "display" or "append" or "edit"
       "params": { # parameters according to the official OpenAI API
-        "model": "gpt-3.5-turbo", # or any other model supported by `"type"` in the OpenAI API, use the playground for reference
+        "model": "gpt-5-mini", # or any other model supported by `"type"` in the OpenAI API, use the playground for reference
         "stop": [
           "```" # a string used to stop the model
         ]
@@ -319,6 +329,14 @@ An example of custom action may look like this: (`#` marks comments)
 }
 ```
 
+Available template variables:
+- `{{input}}` - the selected text
+- `{{filetype}}` - neovim filetype
+- `{{filepath}}` - relative path to the file
+- `{{argument}}` - provided on the command line
+- `{{diagnostic}}` - LSP diagnostic under cursor (format: `[SEVERITY] message (line N)`)
+- `{{diagnostics}}` - all LSP diagnostics in selection (format: `Line N [SEVERITY]: message`)
+
 The `edit` strategy consists in showing the output side by side with the input and
 available for further editing requests.
 For now, `edit` strategy is implemented for `chat` type only.
@@ -332,27 +350,43 @@ The `display` strategy shows the output in a float window.
 When using `ChatGPT` and `ChatGPTEditWithInstructions`, the following
 keybindings are available:
 
-- `<C-Enter>` [Both] to submit.
-- `<C-y>` [Both] to copy/yank last answer.
-- `<C-o>` [Both] Toggle settings window.
-- `<C-h>` [Both] Toggle help window.
-- `<Tab>` [Both] Cycle over windows.
-- `<C-f>` [Chat] Cycle over modes (center, stick to right).
-- `<C-c>` [Both] to close chat window.
-- `<C-p>` [Chat] Toggle sessions list.
-- `<C-u>` [Chat] scroll up chat window.
-- `<C-d>` [Chat] scroll down chat window.
-- `<C-k>` [Chat] to copy/yank code from last answer.
-- `<C-n>` [Chat] Start new session.
-- `<C-r>` [Chat] draft message (create message without submitting it to server)
-- `<C-r>` [Chat] switch role (switch between user and assistant role to define a workflow)
-- `<C-s>` [Both] Toggle system message window.
-- `<C-i>` [Edit Window] use response as input.
-- `<C-d>` [Edit Window] view the diff between left and right panes and use diff-mode
-  commands
+**Submitting and Closing:**
+- `<C-Enter>` / `<Enter>` Submit prompt
+- `q` Close chat window
+- `<C-c>` Stop generating response
 
-When the setting window is opened (with `<C-o>`), settings can be modified by
-pressing `Enter` on the related config. Settings are saved across sections
+**Navigation:**
+- `]m` / `[m` Navigate to next/previous message
+- `]c` / `[c` Navigate to next/previous code block
+- `<C-u>` / `<C-d>` Scroll chat window up/down
+- `<Tab>` Cycle between windows
+
+**Toggles (g prefix):**
+- `gs` Toggle settings panel (read-only)
+- `gh` Toggle help panel
+- `gp` Toggle sessions panel
+- `gr` Toggle system role window
+- `gm` Toggle message role (user/assistant)
+- `gl` Cycle layout modes (center/right)
+- `gn` Start new session
+- `gd` Draft message (add without sending)
+
+**Actions:**
+- `y` Copy code block at cursor
+- `Y` Copy entire last answer
+- `d` Delete selected message
+- `e` Edit selected message
+- `r` Rename session (in sessions panel)
+- `za` Toggle fold for code block
+- `@` Trigger context autocomplete (LSP, project, file, git diff)
+
+**Edit Window specific:**
+- `<C-y>` Accept changes
+- `<C-d>` Toggle diff view
+- `<C-i>` Use response as input
+
+The settings window (`gs`) displays current configuration (model, temperature,
+max_tokens, session name). To change settings, modify your `setup()` configuration.
 
 ### Whichkey plugin mappings
 

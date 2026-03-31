@@ -13,6 +13,10 @@ local Signs = require("chatgpt.signs")
 local Spinner = require("chatgpt.spinner")
 local Session = require("chatgpt.flows.chat.session")
 local SystemWindow = require("chatgpt.flows.chat.system_window")
+local Context = require("chatgpt.context")
+local LspContext = require("chatgpt.context.lsp")
+local ProjectContext = require("chatgpt.context.project")
+local Hints = require("chatgpt.flows.chat.hints")
 
 QUESTION, ANSWER, SYSTEM = 1, 2, 3
 ROLE_ASSISTANT = "assistant"
@@ -40,6 +44,7 @@ function Chat:init()
   self.settings_panel = nil
   self.help_panel = nil
   self.system_role_panel = nil
+  self.hints_panel = nil
 
   -- UI OPEN INDICATORS
   self.settings_open = false
@@ -49,6 +54,14 @@ function Chat:init()
   self.is_streaming_response_lock = false
 
   self.prompt_lines = 1
+
+  -- Input history
+  self.input_history = {}
+  self.history_index = 0
+  self.current_input = ""
+
+  -- Token count
+  self.current_tokens = 0
 
   self.display_mode = Config.options.popup_layout.default
   self.params = Config.options.openai_params
@@ -91,11 +104,14 @@ function Chat:welcome()
     end
   end
 
-  if #self.session.conversation == 0 or (#self.session.conversation == 1 and self.system_message ~= nil) then
-    local lines = Utils.split_string_by_line(Config.options.chat.welcome_message)
-    self:set_lines(0, 0, false, lines)
-    for line_num = 0, #lines do
-      self:add_highlight("ChatGPTWelcome", line_num, 0, -1)
+  -- Show welcome message only in non-compact mode
+  if not self:is_compact() then
+    if #self.session.conversation == 0 or (#self.session.conversation == 1 and self.system_message ~= nil) then
+      local lines = Utils.split_string_by_line(Config.options.chat.welcome_message)
+      self:set_lines(0, 0, false, lines)
+      for line_num = 0, #lines do
+        self:add_highlight("ChatGPTWelcome", line_num, 0, -1)
+      end
     end
   end
   self:render_role()
@@ -106,16 +122,24 @@ function Chat:render_role()
     vim.api.nvim_buf_del_extmark(self.chat_input.bufnr, Config.namespace_id, self.role_extmark_id)
   end
 
+  local virt_text = {}
+
+  -- Add token count if > 0
+  if self.current_tokens > 0 then
+    table.insert(virt_text, { Config.options.chat.border_left_sign, "ChatGPTTokensBorder" })
+    table.insert(virt_text, { self.current_tokens .. " TOKENS", "ChatGPTTokens" })
+    table.insert(virt_text, { Config.options.chat.border_right_sign, "ChatGPTTokensBorder" })
+    table.insert(virt_text, { " " })
+  end
+
+  -- Add role
+  table.insert(virt_text, { Config.options.chat.border_left_sign, "ChatGPTTotalTokensBorder" })
+  table.insert(virt_text, { string.upper(self.role), "ChatGPTTotalTokens" })
+  table.insert(virt_text, { Config.options.chat.border_right_sign, "ChatGPTTotalTokensBorder" })
+  table.insert(virt_text, { " " })
+
   self.role_extmark_id = vim.api.nvim_buf_set_extmark(self.chat_input.bufnr, Config.namespace_id, 0, 0, {
-    virt_text = {
-      { Config.options.chat.border_left_sign, "ChatGPTTotalTokensBorder" },
-      {
-        string.upper(self.role),
-        "ChatGPTTotalTokens",
-      },
-      { Config.options.chat.border_right_sign, "ChatGPTTotalTokensBorder" },
-      { " " },
-    },
+    virt_text = virt_text,
     virt_text_pos = "right_align",
   })
 end
@@ -165,6 +189,10 @@ function Chat:isBusy()
   return self.spinner:is_running() or self.is_streaming_response
 end
 
+function Chat:is_compact()
+  return self.display_mode == "right"
+end
+
 function Chat:add(type, text, usage)
   local idx = self.session:add_item({
     type = type,
@@ -183,7 +211,8 @@ function Chat:_add(type, text, usage, idx)
   local start_line = 0
   if self.selectedIndex > 0 then
     local prev = self.messages[self.selectedIndex]
-    start_line = prev.end_line + (prev.type == ANSWER and 2 or 1)
+    local spacing = self:is_compact() and 1 or (prev.type == ANSWER and 2 or 1)
+    start_line = prev.end_line + spacing
   end
 
   local lines = {}
@@ -211,6 +240,22 @@ function Chat:addQuestion(text)
   self:add(self.role == ROLE_USER and QUESTION or ANSWER, text)
 end
 
+function Chat:addQuestionWithContext(display_text, api_text)
+  local type = self.role == ROLE_USER and QUESTION or ANSWER
+  local idx = self.session:add_item({
+    type = type,
+    text = display_text,
+    api_text = api_text, -- Store expanded version for API
+    usage = {},
+  })
+  self:_add(type, display_text, {}, idx)
+  -- Store api_text in the message for toMessages()
+  if self.messages[self.selectedIndex] then
+    self.messages[self.selectedIndex].api_text = api_text
+  end
+  self:render_role()
+end
+
 function Chat:addSystem(text)
   self:add(SYSTEM, text)
 end
@@ -229,7 +274,8 @@ function Chat:addAnswerPartial(text, state)
   local start_line = 0
   if self.selectedIndex > 0 then
     local prev = self.messages[self.selectedIndex]
-    start_line = prev.end_line + (prev.type == ANSWER and 2 or 1)
+    local spacing = self:is_compact() and 1 or (prev.type == ANSWER and 2 or 1)
+    start_line = prev.end_line + spacing
   end
 
   if state == "END" then
@@ -266,10 +312,12 @@ function Chat:addAnswerPartial(text, state)
     self:redraw()
 
     self.is_streaming_response = false
+    self:update_hints()
   end
 
   if state == "START" then
     self.is_streaming_response = true
+    self:update_hints()
 
     self:stopSpinner()
     self:set_lines(-2, -1, false, { "" })
@@ -433,10 +481,356 @@ function Chat:getSelectedCode()
   return nil
 end
 
+-- Get code block at cursor position in chat window
+function Chat:get_code_at_cursor()
+  if not self.chat_window or not self.chat_window.bufnr then
+    return nil
+  end
+
+  local bufnr = self.chat_window.bufnr
+  local cursor = vim.api.nvim_win_get_cursor(self.chat_window.winid)
+  local cursor_line = cursor[1] - 1 -- 0-indexed
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+  -- Find code block boundaries around cursor
+  local block_start = nil
+  local block_end = nil
+  local in_block = false
+
+  for i, line in ipairs(lines) do
+    local line_idx = i - 1
+    if line:match("^```") then
+      if not in_block then
+        -- Start of block
+        in_block = true
+        block_start = line_idx
+      else
+        -- End of block
+        block_end = line_idx
+        -- Check if cursor is within this block
+        if cursor_line >= block_start and cursor_line <= block_end then
+          -- Extract code (skip first line with ```)
+          local code_lines = {}
+          for j = block_start + 2, block_end do -- +2 to skip ```lang line (1-indexed)
+            table.insert(code_lines, lines[j])
+          end
+          return table.concat(code_lines, "\n")
+        end
+        in_block = false
+        block_start = nil
+      end
+    end
+  end
+
+  return nil
+end
+
 function Chat:get_last_answer()
   for i = #self.messages, 1, -1 do
     if self.messages[i].type == ANSWER then
       return self.messages[i]
+    end
+  end
+end
+
+-- Find all code block positions in the buffer
+function Chat:get_code_block_positions()
+  if not self.chat_window or not self.chat_window.bufnr then
+    return {}
+  end
+
+  local bufnr = self.chat_window.bufnr
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local positions = {}
+  local in_block = false
+  local block_start = nil
+
+  for i, line in ipairs(lines) do
+    if line:match("^```") then
+      if not in_block then
+        in_block = true
+        block_start = i - 1 -- 0-indexed
+      else
+        -- End of block
+        table.insert(positions, { start_line = block_start, end_line = i - 1 })
+        in_block = false
+        block_start = nil
+      end
+    end
+  end
+
+  return positions
+end
+
+-- Navigate to next code block
+function Chat:next_code_block()
+  local positions = self:get_code_block_positions()
+  if #positions == 0 then
+    vim.notify("No code blocks found", vim.log.levels.INFO)
+    return
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(self.chat_window.winid)
+  local current_line = cursor[1] - 1 -- 0-indexed
+
+  for _, pos in ipairs(positions) do
+    if pos.start_line > current_line then
+      vim.api.nvim_win_set_cursor(self.chat_window.winid, { pos.start_line + 1, 0 })
+      return
+    end
+  end
+
+  -- Wrap to first code block
+  vim.api.nvim_win_set_cursor(self.chat_window.winid, { positions[1].start_line + 1, 0 })
+end
+
+-- Navigate to previous code block
+function Chat:prev_code_block()
+  local positions = self:get_code_block_positions()
+  if #positions == 0 then
+    vim.notify("No code blocks found", vim.log.levels.INFO)
+    return
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(self.chat_window.winid)
+  local current_line = cursor[1] - 1 -- 0-indexed
+
+  for i = #positions, 1, -1 do
+    local pos = positions[i]
+    if pos.start_line < current_line then
+      vim.api.nvim_win_set_cursor(self.chat_window.winid, { pos.start_line + 1, 0 })
+      return
+    end
+  end
+
+  -- Wrap to last code block
+  vim.api.nvim_win_set_cursor(self.chat_window.winid, { positions[#positions].start_line + 1, 0 })
+end
+
+-- Apply rich highlighting to message content (code blocks, inline code, @refs, markdown)
+function Chat:highlight_message_content(lines, start_line)
+  local bufnr = self.chat_window.bufnr
+  local in_code_block = false
+  local code_lang = nil
+
+  for i, line in ipairs(lines) do
+    local line_num = start_line + i - 1
+
+    -- Check for code block start/end
+    local block_start = line:match("^```(%w*)")
+
+    if block_start and not in_code_block then
+      in_code_block = true
+      code_lang = block_start ~= "" and block_start or nil
+      -- Hide the ``` line and show language header instead
+      local header_text = {}
+      if code_lang then
+        table.insert(header_text, { " LANGUAGE: " .. string.upper(code_lang) .. " ", "ChatGPTCodeLang" })
+        table.insert(
+          header_text,
+          { " ────────────────── ", "ChatGPTCodeBlockHeader" }
+        )
+        table.insert(header_text, { "[y] copy", "Comment" })
+      else
+        table.insert(header_text, { " CODE ", "ChatGPTCodeLang" })
+        table.insert(
+          header_text,
+          { " ────────────────── ", "ChatGPTCodeBlockHeader" }
+        )
+        table.insert(header_text, { "[y] copy", "Comment" })
+      end
+      vim.api.nvim_buf_set_extmark(bufnr, Config.namespace_id, line_num, 0, {
+        virt_text = header_text,
+        virt_text_pos = "overlay",
+        hl_mode = "combine",
+        virt_lines_above = true,
+        virt_lines = { { { "", "" } } },
+      })
+      vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTCodeBlock", line_num, 0, -1)
+    elseif in_code_block and line == "```" then
+      in_code_block = false
+      code_lang = nil
+      -- Hide the closing ``` with a subtle separator
+      vim.api.nvim_buf_set_extmark(bufnr, Config.namespace_id, line_num, 0, {
+        virt_text = { { "───", "ChatGPTCodeBlockHeader" } },
+        virt_text_pos = "overlay",
+        end_col = 3,
+        conceal = "",
+      })
+      vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTCodeBlock", line_num, 0, -1)
+    elseif in_code_block then
+      -- Check for diff highlighting inside diff blocks
+      if code_lang == "diff" then
+        if line:match("^%+") then
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTDiffAdd", line_num, 0, -1)
+        elseif line:match("^%-") then
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTDiffDel", line_num, 0, -1)
+        else
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTCodeBlock", line_num, 0, -1)
+        end
+      else
+        vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTCodeBlock", line_num, 0, -1)
+      end
+    else
+      -- Headers (# ## ###)
+      if line:match("^#+%s") then
+        vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTHeader", line_num, 0, -1)
+      -- Horizontal rule (--- or ***)
+      elseif line:match("^%-%-%-+%s*$") or line:match("^%*%*%*+%s*$") then
+        vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTHRule", line_num, 0, -1)
+      -- Blockquote (> text)
+      elseif line:match("^>") then
+        vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTBlockquote", line_num, 0, -1)
+      else
+        -- Bullet list markers (- or *)
+        local bullet = line:match("^(%s*[%-%*]%s)")
+        if bullet then
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTListMarker", line_num, 0, #bullet)
+        end
+
+        -- Numbered list markers (1. 2. etc)
+        local num_marker = line:match("^(%s*%d+%.%s)")
+        if num_marker then
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTListMarker", line_num, 0, #num_marker)
+        end
+
+        -- @references
+        for ref in line:gmatch("@[^%s]+") do
+          local s, e = line:find(ref, 1, true)
+          if s then
+            vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTContextRef", line_num, s - 1, e)
+          end
+        end
+
+        -- Inline `code`
+        local col = 1
+        while true do
+          local s, e = line:find("`[^`]+`", col)
+          if not s then
+            break
+          end
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTInlineCode", line_num, s - 1, e)
+          col = e + 1
+        end
+
+        -- **bold**
+        col = 1
+        while true do
+          local s, e = line:find("%*%*[^%*]+%*%*", col)
+          if not s then
+            break
+          end
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTBold", line_num, s - 1, e)
+          col = e + 1
+        end
+
+        -- *italic* or _italic_
+        col = 1
+        while true do
+          local s, e = line:find("%*[^%*]+%*", col)
+          if not s then
+            break
+          end
+          -- Skip if it's actually bold (**)
+          if line:sub(s, s + 1) ~= "**" and (s == 1 or line:sub(s - 1, s - 1) ~= "*") then
+            vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTItalic", line_num, s - 1, e)
+          end
+          col = e + 1
+        end
+
+        -- URLs (http:// or https://)
+        col = 1
+        while true do
+          local s, e = line:find("https?://[^%s%)%]]+", col)
+          if not s then
+            break
+          end
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTLink", line_num, s - 1, e)
+          col = e + 1
+        end
+
+        -- Task lists - [x] done, - [ ] pending
+        local task_done = line:match("^(%s*%-%s*%[x%])")
+        if task_done then
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTTaskDone", line_num, 0, #task_done)
+        end
+        local task_pending = line:match("^(%s*%-%s*%[%s*%])")
+        if task_pending then
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTTaskPending", line_num, 0, #task_pending)
+        end
+
+        -- ~~strikethrough~~
+        col = 1
+        while true do
+          local s, e = line:find("~~[^~]+~~", col)
+          if not s then
+            break
+          end
+          vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTStrikethrough", line_num, s - 1, e)
+          col = e + 1
+        end
+
+        -- Markdown links [text](url)
+        col = 1
+        while true do
+          local s, e = line:find("%[[^%]]+%]%([^%)]+%)", col)
+          if not s then
+            break
+          end
+          -- Find the split between text and url
+          local text_end = line:find("%]%(", s)
+          if text_end then
+            vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTLinkText", line_num, s - 1, text_end)
+            vim.api.nvim_buf_add_highlight(bufnr, Config.namespace_id, "ChatGPTLinkUrl", line_num, text_end, e)
+          end
+          col = e + 1
+        end
+      end
+    end
+  end
+end
+
+-- Add visual divider after answer messages
+function Chat:add_message_divider(line_num)
+  local bufnr = self.chat_window.bufnr
+  local divider = string.rep("─", 60)
+  vim.api.nvim_buf_set_extmark(bufnr, Config.namespace_id, line_num, 0, {
+    virt_lines = { { { divider, "ChatGPTDivider" } } },
+    virt_lines_above = false,
+  })
+end
+
+-- Create folds for code blocks in the message
+function Chat:create_code_folds(lines, start_line)
+  if not self.chat_window or not self.chat_window.winid then
+    return
+  end
+
+  local in_block = false
+  local block_start = nil
+
+  for i, line in ipairs(lines) do
+    local line_num = start_line + i -- 1-indexed for fold commands
+
+    if line:match("^```") then
+      if not in_block then
+        in_block = true
+        block_start = line_num
+      else
+        -- End of block - create fold if block has content
+        if line_num > block_start + 1 then
+          pcall(function()
+            vim.api.nvim_win_call(self.chat_window.winid, function()
+              vim.cmd(block_start .. "," .. line_num .. "fold")
+              -- Open the fold by default
+              vim.cmd(block_start .. "foldopen")
+            end)
+          end)
+        end
+        in_block = false
+        block_start = nil
+      end
     end
   end
 end
@@ -458,9 +852,19 @@ function Chat:renderLastMessage()
   self:set_lines(startIdx, -1, false, lines)
 
   if msg.type == QUESTION then
+    -- Add sender indicator
+    vim.api.nvim_buf_set_extmark(self.chat_window.bufnr, Config.namespace_id, msg.start_line, 0, {
+      virt_text = { { "You ", "ChatGPTSenderUser" } },
+      virt_text_pos = "inline",
+    })
+
+    -- Apply base question styling
     for index, _ in ipairs(lines) do
       self:add_highlight("ChatGPTQuestion", msg.start_line + index - 1, 0, -1)
     end
+
+    -- Apply rich highlighting (overrides base for specific patterns)
+    self:highlight_message_content(lines, msg.start_line)
 
     pcall(
       vim.fn.sign_place,
@@ -471,6 +875,18 @@ function Chat:renderLastMessage()
       { lnum = msg.start_line + 1 }
     )
   else
+    -- Add sender indicator
+    vim.api.nvim_buf_set_extmark(self.chat_window.bufnr, Config.namespace_id, msg.start_line, 0, {
+      virt_text = { { "Assistant ", "ChatGPTSenderAssistant" } },
+      virt_text_pos = "inline",
+    })
+
+    -- Apply rich highlighting for answer (code blocks, inline code, @refs)
+    self:highlight_message_content(lines, msg.start_line)
+
+    -- Create folds for code blocks (open by default, user can close with zc)
+    self:create_code_folds(lines, msg.start_line)
+
     local total_tokens = msg.usage.total_tokens
     if total_tokens ~= nil then
       self.messages[self.selectedIndex].extmark_id =
@@ -489,6 +905,9 @@ function Chat:renderLastMessage()
     end
 
     Signs.set_for_lines(self.chat_window.bufnr, msg.start_line, msg.end_line, "chat")
+
+    -- Add divider after answer
+    self:add_message_divider(msg.end_line)
   end
 
   if self.selectedIndex > 2 then
@@ -525,8 +944,22 @@ end
 
 function Chat:toMessages()
   local messages = {}
-  if self.system_message ~= nil then
-    table.insert(messages, { role = "system", content = self.system_message })
+
+  -- Build system message with optional project summary
+  local system_content = self.system_message or ""
+  if Config.options.context and Config.options.context.project and Config.options.context.project.auto_detect then
+    local project_summary = ProjectContext.generate_summary()
+    if project_summary then
+      if system_content ~= "" then
+        system_content = system_content .. "\n\n[Project: " .. project_summary .. "]"
+      else
+        system_content = "[Project: " .. project_summary .. "]"
+      end
+    end
+  end
+
+  if system_content ~= "" then
+    table.insert(messages, { role = "system", content = system_content })
   end
 
   for _, msg in pairs(self.messages) do
@@ -542,7 +975,8 @@ function Chat:toMessages()
         table.insert(content, createContent(line))
       end
     else
-      content = msg.text
+      -- Use api_text (expanded context) if available, otherwise use display text
+      content = msg.api_text or msg.text
     end
     table.insert(messages, { role = role, content = content })
   end
@@ -673,6 +1107,32 @@ function Chat:set_active_panel(panel)
   else
     self:hide_message_selection()
   end
+
+  -- Update hints based on active panel
+  self:update_hints()
+end
+
+function Chat:update_hints()
+  if not self.hints_panel then
+    return
+  end
+
+  local context = "default"
+  if self.active_panel == self.chat_window then
+    context = "chat_window"
+  elseif self.active_panel == self.chat_input then
+    context = self.is_streaming_response and "chat_input_streaming" or "chat_input"
+  elseif self.active_panel == self.sessions_panel then
+    context = "sessions_panel"
+  elseif self.active_panel == self.settings_panel then
+    context = "settings_panel"
+  elseif self.active_panel == self.help_panel then
+    context = "help_panel"
+  elseif self.active_panel == self.system_role_panel then
+    context = "system_role_panel"
+  end
+
+  Hints.update(context)
 end
 
 function Chat:get_layout_params()
@@ -721,17 +1181,14 @@ function Chat:get_layout_params()
     }, { dir = self.display_mode == "center" and "row" or "col", grow = 1 })
   end
 
-  local box = Layout.Box({
-    left_layout,
-    Layout.Box(self.chat_input, { size = (self.chat_input.border._.style == "none" and 0 or 2) + self.prompt_lines }),
-  }, { dir = "col" })
+  local input_size = (self.chat_input.border._.style == "none" and 0 or 2) + self.prompt_lines
 
+  local main_content
   if #self.open_extra_panels > 0 then
     local extra_boxes = function()
       local box_size = (100 / #self.open_extra_panels) .. "%"
       local boxes = {}
       for i, panel in ipairs(self.open_extra_panels) do
-        -- for the last panel, make it grow to fill the remaining space
         if i == #self.open_extra_panels then
           table.insert(boxes, Layout.Box(panel, { grow = 1 }))
         else
@@ -740,22 +1197,39 @@ function Chat:get_layout_params()
       end
       return Layout.Box(boxes, { dir = "col", size = 40 })
     end
-    box = Layout.Box({
-      Layout.Box({
-        left_layout,
-        Layout.Box(
-          self.chat_input,
-          { size = (self.chat_input.border._.style == "none" and 0 or 2) + self.prompt_lines }
-        ),
-      }, { dir = "col", grow = 1 }),
+    local left_column = Layout.Box({
+      left_layout,
+      Layout.Box(self.chat_input, { size = input_size }),
+    }, { dir = "col", grow = 1 })
+    main_content = Layout.Box({
+      left_column,
       extra_boxes(),
-    }, { dir = "row" })
+    }, { dir = "row", grow = 1 })
+  else
+    main_content = Layout.Box({
+      left_layout,
+      Layout.Box(self.chat_input, { size = input_size }),
+    }, { dir = "col", grow = 1 })
+  end
+
+  -- Build final layout with hints at full width bottom (hidden in compact mode)
+  local box
+  if self.hints_panel and not self:is_compact() then
+    box = Layout.Box({
+      main_content,
+      Layout.Box(self.hints_panel, { size = 1 }),
+    }, { dir = "col" })
+  else
+    box = main_content
   end
 
   return config, box
 end
 
 function Chat:open()
+  -- Store original buffer for context commands
+  self.original_bufnr = vim.api.nvim_get_current_buf()
+
   local displayed_params = Utils.table_shallow_copy(self.params)
   -- if the param is decided by a function and not constant, write <dynamic> for now
   -- TODO: if the current model should be displayed, the settings_panel would
@@ -766,7 +1240,7 @@ function Chat:open()
       displayed_params[key] = "<dynamic>"
     end
   end
-  self.settings_panel = Settings.get_settings_panel("chat_completions", displayed_params)
+  self.settings_panel = Settings.get_settings_panel("chat_completions", displayed_params, self.session.name)
   self.help_panel = Help.get_help_panel("chat")
   self.sessions_panel = Sessions.get_panel(function(session)
     self:set_session(session)
@@ -778,6 +1252,9 @@ function Chat:open()
       self:set_system_message(text)
     end,
   })
+  if Config.options.chat.show_hints then
+    self.hints_panel = Hints.get_panel()
+  end
   self.stop = false
   self.should_stop = function()
     if self.stop then
@@ -793,9 +1270,30 @@ function Chat:open()
       self:hide()
     end,
     on_change = vim.schedule_wrap(function(lines)
-      if self.prompt_lines ~= #lines then
-        self.prompt_lines = #lines
+      -- Calculate tokens (~1.3 tokens per word)
+      local text = table.concat(lines, "\n")
+      local word_count = 0
+      for _ in text:gmatch("%S+") do
+        word_count = word_count + 1
+      end
+      self.current_tokens = math.ceil(word_count * 1.3)
+      self:render_role()
+
+      local new_lines = math.max(1, #lines)
+      if self.prompt_lines ~= new_lines then
+        self.prompt_lines = new_lines
         self:redraw()
+        -- After redraw, scroll to show all content from top
+        vim.schedule(function()
+          if self.chat_input and self.chat_input.winid and vim.api.nvim_win_is_valid(self.chat_input.winid) then
+            local cursor = vim.api.nvim_win_get_cursor(self.chat_input.winid)
+            vim.api.nvim_win_call(self.chat_input.winid, function()
+              -- Scroll to top first, then back to cursor
+              vim.cmd("normal! gg0")
+              vim.api.nvim_win_set_cursor(0, cursor)
+            end)
+          end
+        end)
       end
     end),
     on_submit = function(value)
@@ -809,10 +1307,22 @@ function Chat:open()
         return
       end
 
-      self:addQuestion(value)
+      -- Save to history
+      if value and value ~= "" then
+        table.insert(self.input_history, value)
+        self.history_index = 0
+        self.current_input = ""
+      end
+
+      -- Expand @refs in message for API, keep original for display
+      local api_message, display_message = Context.expand_refs(value)
+      Context.clear()
+
+      -- Store expanded message for API, display shows @refs inline
+      self:addQuestionWithContext(display_message, api_message)
       if self.role == ROLE_USER then
         self:showProgess()
-        local params = vim.tbl_extend("keep", { stream = true, messages = self:toMessages() }, Settings.params)
+        local params = vim.tbl_extend("keep", { stream = true, messages = self:toMessages() }, self.params)
         Api.chat_completions(params, function(answer, state)
           self:addAnswerPartial(answer, state)
         end, self.should_stop)
@@ -855,6 +1365,32 @@ function Chat:open()
     self:prev()
   end, { self.chat_window }, { "n" })
 
+  -- next code block
+  self:map(Config.options.chat.keymaps.next_code_block, function()
+    self:next_code_block()
+  end, { self.chat_window }, { "n" })
+
+  -- prev code block
+  self:map(Config.options.chat.keymaps.prev_code_block, function()
+    self:prev_code_block()
+  end, { self.chat_window }, { "n" })
+
+  -- yank code under cursor
+  self:map(Config.options.chat.keymaps.yank_code, function()
+    local code = self:get_code_at_cursor()
+    if code then
+      vim.fn.setreg(Config.options.yank_register, code)
+      vim.notify("Code copied!", vim.log.levels.INFO)
+    else
+      vim.notify("No code block at cursor", vim.log.levels.WARN)
+    end
+  end, { self.chat_window }, { "n" })
+
+  -- toggle fold
+  self:map(Config.options.chat.keymaps.toggle_fold, function()
+    pcall(vim.cmd, "normal! za")
+  end, { self.chat_window }, { "n" })
+
   -- scroll up
   self:map(Config.options.chat.keymaps.scroll_up, function()
     self:scroll(-1)
@@ -865,14 +1401,149 @@ function Chat:open()
     self.stop = true
   end, { self.chat_input })
 
-  -- close
+  -- history: previous (up arrow)
+  self:map("<Up>", function()
+    if #self.input_history == 0 then
+      return
+    end
+    -- Save current input if starting to navigate
+    if self.history_index == 0 then
+      local lines = vim.api.nvim_buf_get_lines(self.chat_input.bufnr, 0, -1, false)
+      self.current_input = table.concat(lines, "\n")
+    end
+    -- Move back in history
+    if self.history_index < #self.input_history then
+      self.history_index = self.history_index + 1
+      local history_entry = self.input_history[#self.input_history - self.history_index + 1]
+      Utils.modify_buf(self.chat_input.bufnr, function(bufnr)
+        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(history_entry, "\n"))
+      end)
+    end
+  end, { self.chat_input }, { "i", "n" })
+
+  -- history: next (down arrow)
+  self:map("<Down>", function()
+    if self.history_index == 0 then
+      return
+    end
+    -- Move forward in history
+    self.history_index = self.history_index - 1
+    local text
+    if self.history_index == 0 then
+      text = self.current_input
+    else
+      text = self.input_history[#self.input_history - self.history_index + 1]
+    end
+    Utils.modify_buf(self.chat_input.bufnr, function(bufnr)
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(text, "\n"))
+    end)
+  end, { self.chat_input }, { "i", "n" })
+
+  -- Helper to insert text at cursor in input buffer
+  local function insert_at_cursor(text)
+    if self.chat_input and self.chat_input.bufnr and vim.api.nvim_buf_is_valid(self.chat_input.bufnr) then
+      vim.schedule(function()
+        if self.chat_input.winid and vim.api.nvim_win_is_valid(self.chat_input.winid) then
+          vim.api.nvim_set_current_win(self.chat_input.winid)
+          vim.cmd("startinsert!")
+          vim.api.nvim_put({ text .. " " }, "c", true, true)
+        end
+      end)
+    end
+  end
+
+  -- @ context autocomplete
+  self:map("@", function()
+    vim.ui.select({
+      { label = "LSP Symbol", value = "lsp" },
+      { label = "Project Context", value = "project" },
+      { label = "File", value = "file" },
+      { label = "Git Diff", value = "diff" },
+    }, {
+      prompt = "Add Context:",
+      format_item = function(item)
+        return item.label
+      end,
+    }, function(choice)
+      if not choice then
+        return
+      end
+
+      if choice.value == "lsp" then
+        -- Add LSP context from original buffer
+        if self.original_bufnr and vim.api.nvim_buf_is_valid(self.original_bufnr) then
+          vim.api.nvim_set_current_buf(self.original_bufnr)
+          LspContext.get_context(function(item)
+            if item then
+              local ref = Context.make_ref(item)
+              Context.add(ref, item)
+              insert_at_cursor(ref)
+            end
+          end)
+        else
+          vim.notify("No source buffer available for LSP context", vim.log.levels.WARN)
+        end
+      elseif choice.value == "project" then
+        local item = ProjectContext.get_context()
+        if item then
+          local ref = Context.make_ref(item)
+          Context.add(ref, item)
+          insert_at_cursor(ref)
+        end
+      elseif choice.value == "file" then
+        local ok, telescope = pcall(require, "telescope.builtin")
+        if ok then
+          telescope.find_files({
+            attach_mappings = function(prompt_bufnr, map)
+              local actions = require("telescope.actions")
+              local action_state = require("telescope.actions.state")
+              actions.select_default:replace(function()
+                actions.close(prompt_bufnr)
+                local selection = action_state.get_selected_entry()
+                if selection then
+                  local filepath = selection.path or selection[1]
+                  local file_content = vim.fn.readfile(filepath)
+                  if file_content then
+                    local item = {
+                      type = "file",
+                      name = vim.fn.fnamemodify(filepath, ":t"),
+                      file = filepath,
+                      content = table.concat(file_content, "\n"),
+                    }
+                    local ref = Context.make_ref(item)
+                    Context.add(ref, item)
+                    insert_at_cursor(ref)
+                  end
+                end
+              end)
+              return true
+            end,
+          })
+        else
+          vim.notify("Telescope not available for file picker", vim.log.levels.WARN)
+        end
+      elseif choice.value == "diff" then
+        local diff = vim.fn.system("git diff")
+        if diff and diff ~= "" and not diff:match("^fatal:") then
+          local item = {
+            type = "diff",
+            name = "git diff",
+            content = diff,
+          }
+          local ref = Context.make_ref(item)
+          Context.add(ref, item)
+          insert_at_cursor(ref)
+        else
+          vim.notify("No unstaged changes", vim.log.levels.INFO)
+        end
+      end
+    end)
+  end, { self.chat_input }, { "i" })
+
+  -- close (normal mode only - allow typing 'q' in insert mode)
   self:map(Config.options.chat.keymaps.close, function()
     self:hide()
-    -- If current in insert mode, switch to insert mode
-    if vim.fn.mode() == "i" then
-      vim.api.nvim_command("stopinsert")
-    end
-  end)
+  end, nil, { "n" })
 
   -- close_n
   if Config.options.chat.keymaps.close_n then
@@ -910,7 +1581,7 @@ function Chat:open()
     else
       self:set_active_panel(self.chat_input)
     end
-  end)
+  end, nil, { "n" })
 
   -- toggle help
   self:map(Config.options.chat.keymaps.toggle_help, function()
@@ -932,7 +1603,7 @@ function Chat:open()
     else
       self:set_active_panel(self.chat_input)
     end
-  end)
+  end, nil, { "n" })
 
   -- toggle sessions
   self:map(Config.options.chat.keymaps.toggle_sessions, function()
@@ -943,13 +1614,13 @@ function Chat:open()
       table.insert(self.open_extra_panels, self.sessions_panel)
     end
     self:redraw()
-  end)
+  end, nil, { "n" })
 
   -- new session
   self:map(Config.options.chat.keymaps.new_session, function()
     self:new_session()
     Sessions:refresh()
-  end, { self.settings_panel, self.chat_input, self.help_panel })
+  end, { self.settings_panel, self.chat_input, self.help_panel }, { "n" })
 
   -- cycle panes
   self:map(Config.options.chat.keymaps.cycle_windows, function()
@@ -987,7 +1658,7 @@ function Chat:open()
   self:map(Config.options.chat.keymaps.cycle_modes, function()
     self.display_mode = self.display_mode == "right" and "center" or "right"
     self:redraw()
-  end)
+  end, nil, { "n" })
 
   -- toggle system
   self:map(Config.options.chat.keymaps.toggle_system_role_open, function()
@@ -1002,13 +1673,13 @@ function Chat:open()
     if self.system_role_open then
       self:set_active_panel(self.system_role_panel)
     end
-  end)
+  end, nil, { "n" })
 
   -- toggle role
   self:map(Config.options.chat.keymaps.toggle_message_role, function()
     self.role = self.role == ROLE_USER and ROLE_ASSISTANT or ROLE_USER
     self:render_role()
-  end)
+  end, nil, { "n" })
 
   -- draft message
   self:map(Config.options.chat.keymaps.draft_message, function()
@@ -1031,7 +1702,7 @@ function Chat:open()
     else
       vim.notify("Cannot add empty message.", vim.log.levels.WARN)
     end
-  end)
+  end, nil, { "n" })
 
   -- delete message
   self:map(Config.options.chat.keymaps.delete_message, function()
@@ -1055,6 +1726,26 @@ function Chat:open()
   self.layout:mount()
   self:welcome()
 
+  -- Initialize hints with default context (input panel)
+  if self.hints_panel then
+    self.active_panel = self.chat_input
+    self:update_hints()
+  end
+
+  -- Setup resize handling
+  local resize_group = vim.api.nvim_create_augroup("ChatGPTResize", { clear = true })
+  local function on_resize()
+    if self.layout and self.layout.winid then
+      self:redraw(true)
+    end
+  end
+  vim.api.nvim_create_autocmd("VimResized", { group = resize_group, callback = on_resize })
+  -- WinResized available in Neovim 0.9+
+  if vim.fn.has("nvim-0.9") == 1 then
+    vim.api.nvim_create_autocmd("WinResized", { group = resize_group, callback = on_resize })
+  end
+  self.resize_group = resize_group
+
   local event = require("nui.utils.autocmd").event
   self.chat_input:on(event.QuitPre, function()
     self.active = false
@@ -1076,10 +1767,27 @@ function Chat:redraw(noinit)
 end
 
 function Chat:hide()
+  -- Cleanup resize autocmd
+  if self.resize_group then
+    vim.api.nvim_create_augroup("ChatGPTResize", { clear = true })
+  end
   self.layout:hide()
 end
 
 function Chat:show()
+  -- Re-register resize handling
+  local resize_group = vim.api.nvim_create_augroup("ChatGPTResize", { clear = true })
+  local function on_resize()
+    if self.layout and self.layout.winid then
+      self:redraw(true)
+    end
+  end
+  vim.api.nvim_create_autocmd("VimResized", { group = resize_group, callback = on_resize })
+  if vim.fn.has("nvim-0.9") == 1 then
+    vim.api.nvim_create_autocmd("WinResized", { group = resize_group, callback = on_resize })
+  end
+  self.resize_group = resize_group
+
   self:redraw(true)
   self.layout:show()
 end
